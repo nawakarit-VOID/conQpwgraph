@@ -1,0 +1,57 @@
+# OBS PiP Router
+
+โปรแกรม Go + Fyne สำหรับ Linux Mint (Cinnamon/X11) ที่จะ:
+
+1. สร้าง virtual sink ชื่อ `OBS_Record` ให้ OBS capture ทิ้งไว้ถาวร
+2. เฝ้าดูหน้าต่าง **Picture-in-Picture** ของ Firefox (จับจาก WM_CLASS "Toolkit..."
+   ไม่ขึ้นกับภาษา UI)
+3. เมื่อเจอ PiP ขึ้นมา จะพยายามจับคู่ PID ของหน้าต่างนั้นกับ audio stream ที่กำลัง
+   เล่นอยู่ (`application.process.id`) แล้วย้าย stream นั้นเข้า `OBS_Record`
+   อัตโนมัติ — ถ้า PID ไม่ตรงกันเป๊ะ (Firefox บางรุ่นแยก process ต่อแท็บ) จะ fallback
+   ไปจับ stream ของ Firefox ตัวล่าสุดที่ยังไม่ถูกย้ายแทน
+4. กด "หยุด" เมื่อไหร่ จะย้ายทุก stream ที่ routed ไว้กลับ default sink ให้เอง
+
+## สิ่งที่ต้องติดตั้งก่อน (ครั้งเดียว)
+
+```bash
+sudo apt update
+sudo apt install golang wmctrl xdotool pulseaudio-utils \
+    build-essential libgl1-mesa-dev xorg-dev
+```
+
+- `wmctrl`, `xdotool` — ใช้ตรวจจับหน้าต่าง PiP
+- `pulseaudio-utils` — ให้คำสั่ง `pactl` (ใช้งานได้แม้ backend จะเป็น PipeWire
+  เพราะมี pipewire-pulse compatibility layer อยู่แล้วใน Mint รุ่นใหม่)
+- `libgl1-mesa-dev`, `xorg-dev` — Fyne ต้องใช้คอมไพล์ผ่าน CGO เพื่อเชื่อม
+  OpenGL/X11
+
+## Build
+
+```bash
+cd obs-pip-router
+go mod tidy      # ดึงไลบรารี fyne.io/fyne/v2 (ต้องต่อเน็ต)
+go build -o obs-pip-router
+```
+
+## รันโปรแกรม
+
+```bash
+./obs-pip-router
+```
+
+จะมีหน้าต่างเล็กๆ ขึ้นมา มีปุ่ม "เริ่มอัด" / "หยุด" และ log แสดงสถานะ
+
+## ตั้งค่า OBS (ทำครั้งเดียว)
+
+ใน OBS เพิ่ม Source แบบ **Audio Output Capture** (ไม่ใช่ Audio Input Capture)
+แล้วเลือก device เป็น `Monitor of OBS_Record` — ตั้งครั้งเดียวใช้ได้ตลอดไป
+ไม่ต้องมาต่อสายใหม่อีก
+
+## จุดที่ควรทดสอบ/ปรับต่อ
+
+- ถ้า `findPiPWindowPID` หา PID ไม่ตรงกับ stream เสมอ (fallback ทำงานบ่อย)
+  ลองเช็คว่า Firefox รุ่นที่ใช้แยก content process ต่อแท็บหรือไม่ อาจต้องเปลี่ยน
+  ไปจับคู่ด้วย parent process id (PPID) แทน
+- `sinkName` ใน `main.go` แก้ชื่อ sink ได้ตามต้องการ
+- ปุ่ม "หยุด" ปัจจุบันไม่ได้ unload sink module ทิ้ง (เก็บไว้เผื่อใช้รอบหน้า)
+  ถ้าอยากลบด้วยให้เพิ่มคำสั่ง `pactl unload-module module-null-sink`
