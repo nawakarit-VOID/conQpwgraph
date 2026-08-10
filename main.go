@@ -23,9 +23,31 @@ const sinkName = "OBS_Record"
 // SinkInput เก็บข้อมูล audio stream หนึ่งตัวจาก `pactl list sink-inputs`
 type SinkInput struct {
 	ID        int
-	SinkIndex int // index ของ sink ปลายทางที่ stream นี้กำลังต่ออยู่ตอนนี้
-	AppName   string
-	MediaName string
+	SinkIndex int               // index ของ sink ปลายทางที่ stream นี้กำลังต่ออยู่ตอนนี้
+	Props     map[string]string // property ทั้งหมด เช่น application.name, media.title, application.process.id
+}
+
+// DisplayLabel รวม property ที่น่าจะบอกได้ว่าเป็นแหล่งเสียงไหน
+// ลำดับความสำคัญ: media.title > media.name (ถ้า Firefox/แอปไม่ส่งชื่อแท็บมา
+// จะเหลือแค่ "Playback" เฉยๆ ซึ่งเป็นข้อจำกัดของแอปนั้น ไม่ใช่บั๊กโปรแกรม)
+func (si SinkInput) DisplayLabel() string {
+	appName := si.Props["application.name"]
+	if appName == "" {
+		appName = "Unknown"
+	}
+	title := si.Props["media.title"]
+	if title == "" {
+		title = si.Props["media.name"]
+	}
+
+	label := appName
+	if title != "" && title != appName {
+		label = fmt.Sprintf("%s — %s", appName, title)
+	}
+	if pid := si.Props["application.process.id"]; pid != "" {
+		label = fmt.Sprintf("%s [pid %s]", label, pid)
+	}
+	return label
 }
 
 func runCmd(name string, args ...string) (string, error) {
@@ -75,8 +97,8 @@ func ensureSink() error {
 
 var sinkInputHeaderRe = regexp.MustCompile(`(?m)^Sink Input #(\d+)`)
 var sinkIndexRe = regexp.MustCompile(`(?m)^\s*Sink:\s*(\d+)`)
-var appNameRe = regexp.MustCompile(`application\.name = "([^"]*)"`)
-var mediaNameRe = regexp.MustCompile(`(?m)^\s*Media Name:\s*"([^"]*)"`)
+var mediaNameLineRe = regexp.MustCompile(`(?m)^\s*Media Name:\s*"([^"]*)"`)
+var propLineRe = regexp.MustCompile(`(?m)^\s*([\w.]+)\s*=\s*"([^"]*)"`)
 
 // listSinkInputs อ่าน audio stream ทั้งหมดที่กำลังเล่นอยู่ตอนนี้
 func listSinkInputs() ([]SinkInput, error) {
@@ -95,15 +117,20 @@ func listSinkInputs() ([]SinkInput, error) {
 		block := out[start:end]
 
 		id, _ := strconv.Atoi(out[loc[2]:loc[3]])
-		si := SinkInput{ID: id, SinkIndex: -1}
+		si := SinkInput{ID: id, SinkIndex: -1, Props: map[string]string{}}
 		if sm := sinkIndexRe.FindStringSubmatch(block); sm != nil {
 			si.SinkIndex, _ = strconv.Atoi(sm[1])
 		}
-		if am := appNameRe.FindStringSubmatch(block); am != nil {
-			si.AppName = am[1]
+		// property ในหัวข้อ "Properties:" รูปแบบ key = "value"
+		for _, pm := range propLineRe.FindAllStringSubmatch(block, -1) {
+			si.Props[pm[1]] = pm[2]
 		}
-		if mm := mediaNameRe.FindStringSubmatch(block); mm != nil {
-			si.MediaName = mm[1]
+		// "Media Name:" อยู่นอกส่วน Properties แยกต่างหาก เก็บไว้เป็น media.name
+		// สำรอง เผื่อ Properties ไม่มี media.name/media.title
+		if mm := mediaNameLineRe.FindStringSubmatch(block); mm != nil {
+			if _, ok := si.Props["media.name"]; !ok {
+				si.Props["media.name"] = mm[1]
+			}
 		}
 		result = append(result, si)
 	}
@@ -153,10 +180,7 @@ func (a *recorderApp) scan() {
 	}
 	for _, si := range inputs {
 		si := si // capture ตัวแปรสำหรับ closure
-		label := si.AppName
-		if si.MediaName != "" {
-			label = fmt.Sprintf("%s — %s", si.AppName, si.MediaName)
-		}
+		label := si.DisplayLabel()
 		connected := si.SinkIndex == obsIndex
 		prefix := "⬜ "
 		importance := widget.MediumImportance
