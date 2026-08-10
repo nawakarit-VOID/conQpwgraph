@@ -140,6 +140,9 @@ type recorderApp struct {
 	cancel context.CancelFunc
 	mu     sync.Mutex
 	routed map[int]bool // sink-input id ที่ถูกย้ายไปแล้ว กันย้ำซ้ำ
+
+	sessionActive bool // true ระหว่างที่หน้าต่าง PiP ยังเปิดอยู่ต่อเนื่อง
+	fallbackUsed  bool // กันไม่ให้ fallback สุ่มหยิบซ้ำหลายรอบในเซสชันเดียวกัน
 }
 
 // หมายเหตุ: การอัปเดต widget จาก goroutine พื้นหลังแบบตรงๆ ใน Fyne
@@ -166,6 +169,8 @@ func (a *recorderApp) start() {
 
 	a.mu.Lock()
 	a.routed = make(map[int]bool)
+	a.sessionActive = false
+	a.fallbackUsed = false
 	a.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -213,14 +218,42 @@ func (a *recorderApp) tick() {
 		a.appendLog("เช็คหน้าต่าง PiP ผิดพลาด: %v", err)
 		return
 	}
+
+	a.mu.Lock()
+	wasActive := a.sessionActive
+	a.mu.Unlock()
+
 	if !found {
+		// PiP ปิดไปแล้ว รีเซ็ตสถานะเซสชัน เผื่อรอบหน้าจะเปิดใหม่
+		if wasActive {
+			a.mu.Lock()
+			a.sessionActive = false
+			a.fallbackUsed = false
+			a.mu.Unlock()
+		}
 		return
+	}
+
+	isRisingEdge := !wasActive
+	if isRisingEdge {
+		a.mu.Lock()
+		a.sessionActive = true
+		a.mu.Unlock()
 	}
 
 	inputs, err := listSinkInputs()
 	if err != nil {
 		a.appendLog("อ่าน audio stream ผิดพลาด: %v", err)
 		return
+	}
+
+	// debug log ทุกครั้งที่เจอ PiP รอบใหม่ ช่วยไล่ดูว่า PID ที่ได้กับที่มีใน stream ตรงกันไหม
+	if isRisingEdge {
+		var ids []string
+		for _, si := range inputs {
+			ids = append(ids, fmt.Sprintf("#%d pid=%d app=%s", si.ID, si.ProcessID, si.AppName))
+		}
+		a.appendLog("[debug] เจอ PiP PID=%d | streams ตอนนี้: %s", pid, strings.Join(ids, ", "))
 	}
 
 	matched := false
@@ -250,7 +283,15 @@ func (a *recorderApp) tick() {
 	}
 
 	// Fallback: ไม่เจอ process.id ตรงกันเป๊ะ (เช่น Firefox แยก process ต่อแท็บ)
-	// ลองจับ stream ของ Firefox ตัวล่าสุดที่ยังไม่ถูกย้ายแทน
+	// ทำแค่ครั้งเดียวต่อการเปิด PiP หนึ่งรอบ ไม่งั้นจะสุ่มกวาดทุก stream ทีละตัวไปเรื่อยๆ
+	a.mu.Lock()
+	alreadyFellBack := a.fallbackUsed
+	a.mu.Unlock()
+	if alreadyFellBack {
+		return
+	}
+
+	// เลือก stream ของ Firefox ที่ยังไม่ถูกย้าย โดยเอาตัวที่ id สูงสุด (สร้างล่าสุด)
 	var fallback *SinkInput
 	for i := range inputs {
 		si := &inputs[i]
@@ -260,10 +301,18 @@ func (a *recorderApp) tick() {
 		a.mu.Lock()
 		already := a.routed[si.ID]
 		a.mu.Unlock()
-		if !already {
+		if already {
+			continue
+		}
+		if fallback == nil || si.ID > fallback.ID {
 			fallback = si
 		}
 	}
+
+	a.mu.Lock()
+	a.fallbackUsed = true
+	a.mu.Unlock()
+
 	if fallback == nil {
 		return
 	}
@@ -274,7 +323,7 @@ func (a *recorderApp) tick() {
 	a.mu.Lock()
 	a.routed[fallback.ID] = true
 	a.mu.Unlock()
-	a.appendLog("ไม่พบ PID ตรงกัน ใช้ fallback: ย้าย stream #%d (%s) เข้า %s", fallback.ID, fallback.AppName, sinkName)
+	a.appendLog("ไม่พบ PID ตรงกัน ใช้ fallback (ครั้งเดียว): ย้าย stream #%d (%s) เข้า %s", fallback.ID, fallback.AppName, sinkName)
 }
 
 func main() {
