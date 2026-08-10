@@ -4,14 +4,12 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -25,8 +23,9 @@ const sinkName = "OBS_Record"
 // SinkInput เก็บข้อมูล audio stream หนึ่งตัวจาก `pactl list sink-inputs`
 type SinkInput struct {
 	ID        int
-	ProcessID int
+	SinkIndex int // index ของ sink ปลายทางที่ stream นี้กำลังต่ออยู่ตอนนี้
 	AppName   string
+	MediaName string
 }
 
 func runCmd(name string, args ...string) (string, error) {
@@ -35,13 +34,32 @@ func runCmd(name string, args ...string) (string, error) {
 	return string(out), err
 }
 
-// sinkExists ตรวจสอบว่า virtual sink มีอยู่แล้วหรือยัง
-func sinkExists() bool {
+// getSinkIndex หา index ตัวเลขของ sink จากชื่อ (จาก `pactl list sinks short`)
+func getSinkIndex(name string) (int, error) {
 	out, err := runCmd("pactl", "list", "sinks", "short")
 	if err != nil {
-		return false
+		return -1, err
 	}
-	return strings.Contains(out, sinkName)
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		if fields[1] == name {
+			idx, err := strconv.Atoi(fields[0])
+			if err != nil {
+				return -1, err
+			}
+			return idx, nil
+		}
+	}
+	return -1, fmt.Errorf("ไม่พบ sink ชื่อ %s", name)
+}
+
+// sinkExists ตรวจสอบว่า virtual sink มีอยู่แล้วหรือยัง
+func sinkExists() bool {
+	_, err := getSinkIndex(sinkName)
+	return err == nil
 }
 
 // ensureSink สร้าง null-sink ถ้ายังไม่มี (idempotent)
@@ -55,43 +73,10 @@ func ensureSink() error {
 	return err
 }
 
-// รูปแบบบรรทัดของ `wmctrl -lx`:
-// <window_id> <desktop> <WM_CLASS> <hostname> <title...>
-var wmctrlLineRe = regexp.MustCompile(`^(\S+)\s+(-?\d+)\s+(\S+)\s+(\S+)\s+(.*)$`)
-
-// findPiPWindowPID มองหาหน้าต่าง Picture-in-Picture ของ Firefox
-// สังเกตจาก WM_CLASS ที่ขึ้นต้นด้วย "Toolkit" (คงที่ไม่ว่า UI จะภาษาอะไร)
-// แล้วคืน PID ของหน้าต่างนั้น
-func findPiPWindowPID() (int, bool, error) {
-	out, err := runCmd("wmctrl", "-lx")
-	if err != nil {
-		return 0, false, err
-	}
-	for _, line := range strings.Split(out, "\n") {
-		m := wmctrlLineRe.FindStringSubmatch(line)
-		if m == nil {
-			continue
-		}
-		windowID, class := m[1], m[3]
-		if !strings.Contains(strings.ToLower(class), "toolkit") {
-			continue
-		}
-		pidOut, err := runCmd("xdotool", "getwindowpid", windowID)
-		if err != nil {
-			continue
-		}
-		pid, err := strconv.Atoi(strings.TrimSpace(pidOut))
-		if err != nil {
-			continue
-		}
-		return pid, true, nil
-	}
-	return 0, false, nil
-}
-
 var sinkInputHeaderRe = regexp.MustCompile(`(?m)^Sink Input #(\d+)`)
-var processIDRe = regexp.MustCompile(`application\.process\.id = "(\d+)"`)
+var sinkIndexRe = regexp.MustCompile(`(?m)^\s*Sink:\s*(\d+)`)
 var appNameRe = regexp.MustCompile(`application\.name = "([^"]*)"`)
+var mediaNameRe = regexp.MustCompile(`(?m)^\s*Media Name:\s*"([^"]*)"`)
 
 // listSinkInputs อ่าน audio stream ทั้งหมดที่กำลังเล่นอยู่ตอนนี้
 func listSinkInputs() ([]SinkInput, error) {
@@ -110,19 +95,22 @@ func listSinkInputs() ([]SinkInput, error) {
 		block := out[start:end]
 
 		id, _ := strconv.Atoi(out[loc[2]:loc[3]])
-		si := SinkInput{ID: id}
-		if pm := processIDRe.FindStringSubmatch(block); pm != nil {
-			si.ProcessID, _ = strconv.Atoi(pm[1])
+		si := SinkInput{ID: id, SinkIndex: -1}
+		if sm := sinkIndexRe.FindStringSubmatch(block); sm != nil {
+			si.SinkIndex, _ = strconv.Atoi(sm[1])
 		}
 		if am := appNameRe.FindStringSubmatch(block); am != nil {
 			si.AppName = am[1]
+		}
+		if mm := mediaNameRe.FindStringSubmatch(block); mm != nil {
+			si.MediaName = mm[1]
 		}
 		result = append(result, si)
 	}
 	return result, nil
 }
 
-// moveSinkInput ย้าย audio stream ไปยัง sink ปลายทาง
+// moveSinkInput ย้าย audio stream ไปยัง sink ปลายทาง (ระบุด้วยชื่อ)
 func moveSinkInput(id int, sink string) error {
 	_, err := runCmd("pactl", "move-sink-input", strconv.Itoa(id), sink)
 	return err
@@ -131,221 +119,90 @@ func moveSinkInput(id int, sink string) error {
 // ---------- ส่วน GUI ----------
 
 type recorderApp struct {
-	win      fyne.Window
-	status   *widget.Label
-	logBox   *widget.Entry
-	startBtn *widget.Button
-	stopBtn  *widget.Button
-
-	cancel context.CancelFunc
-	mu     sync.Mutex
-	routed map[int]bool // sink-input id ที่ถูกย้ายไปแล้ว กันย้ำซ้ำ
-
-	sessionActive bool // true ระหว่างที่หน้าต่าง PiP ยังเปิดอยู่ต่อเนื่อง
-	fallbackUsed  bool // กันไม่ให้ fallback สุ่มหยิบซ้ำหลายรอบในเซสชันเดียวกัน
-}
-
-// หมายเหตุ: การอัปเดต widget จาก goroutine พื้นหลังแบบตรงๆ ใน Fyne
-// เวอร์ชันเก่าทำได้ในทางปฏิบัติ แต่ถ้าใช้ Fyne >= 2.5 แนะนำห่อด้วย fyne.Do(...)
-// เพื่อความปลอดภัยด้าน thread เต็มรูปแบบ
-func (a *recorderApp) appendLog(format string, args ...interface{}) {
-	msg := fmt.Sprintf(format, args...)
-	a.logBox.SetText(a.logBox.Text + msg + "\n")
+	win        fyne.Window
+	status     *widget.Label
+	sourcesBox *fyne.Container
+	scanBtn    *widget.Button
+	mu         sync.Mutex
 }
 
 func (a *recorderApp) setStatus(text string) {
 	a.status.SetText(text)
 }
 
-func (a *recorderApp) start() {
+// scan ดึงรายชื่อ audio stream ทั้งหมดตอนนี้ แล้วสร้างปุ่ม toggle ให้แต่ละตัว
+func (a *recorderApp) scan() {
 	if err := ensureSink(); err != nil {
-		a.appendLog("สร้าง sink ไม่สำเร็จ: %v", err)
+		a.setStatus(fmt.Sprintf("สร้าง sink ไม่สำเร็จ: %v", err))
 		return
 	}
-	a.appendLog("สร้าง/ยืนยัน sink %s เรียบร้อย", sinkName)
-	a.setStatus("สถานะ: กำลังเฝ้ารอ Picture-in-Picture...")
-	a.startBtn.Disable()
-	a.stopBtn.Enable()
-
-	a.mu.Lock()
-	a.routed = make(map[int]bool)
-	a.sessionActive = false
-	a.fallbackUsed = false
-	a.mu.Unlock()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	a.cancel = cancel
-	go a.watchLoop(ctx)
-}
-
-func (a *recorderApp) stop() {
-	if a.cancel != nil {
-		a.cancel()
-		a.cancel = nil
-	}
-	a.mu.Lock()
-	for id := range a.routed {
-		if err := moveSinkInput(id, "@DEFAULT_SINK@"); err != nil {
-			a.appendLog("ย้าย stream #%d กลับไม่สำเร็จ: %v", id, err)
-		} else {
-			a.appendLog("ย้าย stream #%d กลับ default sink แล้ว", id)
-		}
-	}
-	a.routed = make(map[int]bool)
-	a.mu.Unlock()
-
-	a.setStatus("สถานะ: หยุดแล้ว")
-	a.startBtn.Enable()
-	a.stopBtn.Disable()
-}
-
-func (a *recorderApp) watchLoop(ctx context.Context) {
-	ticker := time.NewTicker(1500 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			a.tick()
-		}
-	}
-}
-
-func (a *recorderApp) tick() {
-	pid, found, err := findPiPWindowPID()
+	obsIndex, err := getSinkIndex(sinkName)
 	if err != nil {
-		a.appendLog("เช็คหน้าต่าง PiP ผิดพลาด: %v", err)
+		a.setStatus(fmt.Sprintf("หา sink ไม่เจอ: %v", err))
 		return
 	}
-
-	a.mu.Lock()
-	wasActive := a.sessionActive
-	a.mu.Unlock()
-
-	if !found {
-		// PiP ปิดไปแล้ว รีเซ็ตสถานะเซสชัน เผื่อรอบหน้าจะเปิดใหม่
-		if wasActive {
-			a.mu.Lock()
-			a.sessionActive = false
-			a.fallbackUsed = false
-			a.mu.Unlock()
-		}
-		return
-	}
-
-	isRisingEdge := !wasActive
-	if isRisingEdge {
-		a.mu.Lock()
-		a.sessionActive = true
-		a.mu.Unlock()
-	}
-
 	inputs, err := listSinkInputs()
 	if err != nil {
-		a.appendLog("อ่าน audio stream ผิดพลาด: %v", err)
+		a.setStatus(fmt.Sprintf("อ่าน audio stream ผิดพลาด: %v", err))
 		return
 	}
 
-	// debug log ทุกครั้งที่เจอ PiP รอบใหม่ ช่วยไล่ดูว่า PID ที่ได้กับที่มีใน stream ตรงกันไหม
-	if isRisingEdge {
-		var ids []string
-		for _, si := range inputs {
-			ids = append(ids, fmt.Sprintf("#%d pid=%d app=%s", si.ID, si.ProcessID, si.AppName))
-		}
-		a.appendLog("[debug] เจอ PiP PID=%d | streams ตอนนี้: %s", pid, strings.Join(ids, ", "))
+	var objs []fyne.CanvasObject
+	if len(inputs) == 0 {
+		objs = append(objs, widget.NewLabel("ไม่พบแหล่งเสียงที่กำลังเล่นอยู่ตอนนี้"))
 	}
-
-	matched := false
 	for _, si := range inputs {
-		if si.ProcessID != pid {
-			continue
+		si := si // capture ตัวแปรสำหรับ closure
+		label := si.AppName
+		if si.MediaName != "" {
+			label = fmt.Sprintf("%s — %s", si.AppName, si.MediaName)
 		}
-		matched = true
-		a.mu.Lock()
-		already := a.routed[si.ID]
-		a.mu.Unlock()
-		if already {
-			continue
+		connected := si.SinkIndex == obsIndex
+		prefix := "⬜ "
+		importance := widget.MediumImportance
+		if connected {
+			prefix = "✅ "
+			importance = widget.SuccessImportance
 		}
-		if err := moveSinkInput(si.ID, sinkName); err != nil {
-			a.appendLog("ย้าย stream #%d ไม่สำเร็จ: %v", si.ID, err)
-			continue
+		btnLabel := fmt.Sprintf("%s%s (#%d)", prefix, label, si.ID)
+
+		btn := widget.NewButton(btnLabel, nil)
+		btn.Importance = importance
+		btn.OnTapped = func() {
+			var target string
+			if connected {
+				target = "@DEFAULT_SINK@"
+			} else {
+				target = sinkName
+			}
+			if err := moveSinkInput(si.ID, target); err != nil {
+				a.setStatus(fmt.Sprintf("ย้าย stream #%d ไม่สำเร็จ: %v", si.ID, err))
+				return
+			}
+			a.scan() // สแกนใหม่เพื่ออัปเดตสถานะปุ่มทั้งหมดให้ตรงความจริง
 		}
-		a.mu.Lock()
-		a.routed[si.ID] = true
-		a.mu.Unlock()
-		a.appendLog("เจอ PiP (PID %d) -> ย้าย stream #%d (%s) เข้า %s แล้ว", pid, si.ID, si.AppName, sinkName)
+		objs = append(objs, btn)
 	}
 
-	if matched {
-		return
-	}
-
-	// Fallback: ไม่เจอ process.id ตรงกันเป๊ะ (เช่น Firefox แยก process ต่อแท็บ)
-	// ทำแค่ครั้งเดียวต่อการเปิด PiP หนึ่งรอบ ไม่งั้นจะสุ่มกวาดทุก stream ทีละตัวไปเรื่อยๆ
-	a.mu.Lock()
-	alreadyFellBack := a.fallbackUsed
-	a.mu.Unlock()
-	if alreadyFellBack {
-		return
-	}
-
-	// เลือก stream ของ Firefox ที่ยังไม่ถูกย้าย โดยเอาตัวที่ id สูงสุด (สร้างล่าสุด)
-	var fallback *SinkInput
-	for i := range inputs {
-		si := &inputs[i]
-		if !strings.Contains(strings.ToLower(si.AppName), "firefox") {
-			continue
-		}
-		a.mu.Lock()
-		already := a.routed[si.ID]
-		a.mu.Unlock()
-		if already {
-			continue
-		}
-		if fallback == nil || si.ID > fallback.ID {
-			fallback = si
-		}
-	}
-
-	a.mu.Lock()
-	a.fallbackUsed = true
-	a.mu.Unlock()
-
-	if fallback == nil {
-		return
-	}
-	if err := moveSinkInput(fallback.ID, sinkName); err != nil {
-		a.appendLog("ย้าย stream fallback ไม่สำเร็จ: %v", err)
-		return
-	}
-	a.mu.Lock()
-	a.routed[fallback.ID] = true
-	a.mu.Unlock()
-	a.appendLog("ไม่พบ PID ตรงกัน ใช้ fallback (ครั้งเดียว): ย้าย stream #%d (%s) เข้า %s", fallback.ID, fallback.AppName, sinkName)
+	a.sourcesBox.Objects = objs
+	a.sourcesBox.Refresh()
+	a.setStatus(fmt.Sprintf("สถานะ: เจอ %d แหล่งเสียง (สแกนล่าสุด)", len(inputs)))
 }
 
 func main() {
 	a := app.New()
-	w := a.NewWindow("OBS PiP Router")
-	w.Resize(fyne.NewSize(480, 360))
+	w := a.NewWindow("OBS Audio Router")
+	w.Resize(fyne.NewSize(480, 420))
 
 	ra := &recorderApp{win: w}
-	ra.status = widget.NewLabel("สถานะ: ยังไม่เริ่ม")
-	ra.logBox = widget.NewMultiLineEntry()
-	ra.logBox.Wrapping = fyne.TextWrapWord
-	ra.logBox.SetMinRowsVisible(10)
+	ra.status = widget.NewLabel("สถานะ: ยังไม่ได้สแกน")
+	ra.sourcesBox = container.NewVBox()
+	ra.scanBtn = widget.NewButton("สแกนแหล่งเสียง", ra.scan)
 
-	ra.startBtn = widget.NewButton("เริ่มอัด", ra.start)
-	ra.stopBtn = widget.NewButton("หยุด", ra.stop)
-	ra.stopBtn.Disable()
-
-	buttons := container.NewHBox(ra.startBtn, ra.stopBtn)
 	content := container.NewBorder(
-		container.NewVBox(ra.status, buttons),
+		container.NewVBox(ra.status, ra.scanBtn, widget.NewSeparator()),
 		nil, nil, nil,
-		container.NewScroll(ra.logBox),
+		container.NewVScroll(ra.sourcesBox),
 	)
 	w.SetContent(content)
 	w.ShowAndRun()
